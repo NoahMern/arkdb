@@ -19,9 +19,8 @@ public class SkipList {
   - keyOffset: 4 bytes (int)
   - keySize: 2 bytes (short)
   - height: 2 bytes (short)
-  - tower: MAX_LEVEL * 4 bytes (int array of offsets to next nodes)
   */
-  private static final MemoryLayout NODE_LAYOUT =
+  private static final MemoryLayout NODE_HEADER_LAYOUT =
      MemoryLayout.structLayout(
       JAVA_LONG.withName("value"), // (valueOffset, valueSize)
       JAVA_INT.withName("keyOffset"),
@@ -29,16 +28,17 @@ public class SkipList {
       JAVA_SHORT.withName("height")
      );
 
-  private static final VarHandle VALUE_HANDLE = NODE_LAYOUT.varHandle(
+  private static final VarHandle VALUE_HANDLE = NODE_HEADER_LAYOUT.varHandle(
     MemoryLayout.PathElement.groupElement("value"));
-  private static final VarHandle KEY_OFFSET_HANDLE = NODE_LAYOUT.varHandle(
+  private static final VarHandle KEY_OFFSET_HANDLE = NODE_HEADER_LAYOUT.varHandle(
     MemoryLayout.PathElement.groupElement("keyOffset"));
-  private static final VarHandle KEY_SIZE_HANDLE = NODE_LAYOUT.varHandle(
+  private static final VarHandle KEY_SIZE_HANDLE = NODE_HEADER_LAYOUT.varHandle(
     MemoryLayout.PathElement.groupElement("keySize"));
-  private static final VarHandle HEIGHT_HANDLE = NODE_LAYOUT.varHandle(
+  private static final VarHandle HEIGHT_HANDLE = NODE_HEADER_LAYOUT.varHandle(
     MemoryLayout.PathElement.groupElement("height"));
+  private static final VarHandle NEXT_HANDLE = JAVA_INT.varHandle();
 
-  private static final int NODE_SIZE = (int) NODE_LAYOUT.byteSize();
+  private static final int NODE_SIZE = (int) NODE_HEADER_LAYOUT.byteSize();
 
   private static final int NULL = 0;
 
@@ -47,68 +47,58 @@ public class SkipList {
   private final MemorySegment memory;
   private final int memorySize;
   // memory 0 is reserved for representing NULL pointer
-
   private final AtomicInteger head = new AtomicInteger(1);
-  private final AtomicInteger height = new AtomicInteger(1);
-
-  // offsets of head's next nodes at each level
-  private final int[] nextOffsets = new int[MAX_HEIGHT];
+  private final int rootOffset;
 
   public SkipList(MemorySegment memory) {
     this.memory = memory;
     this.memorySize = (int) memory.byteSize();
+    this.rootOffset = newNode(new byte[0], new byte[0], MAX_HEIGHT);
   }
 
   private int newNode(byte[] key, byte[] value,int height) {
-    int nodeOffset = allocateNode(height);
-    if (nodeOffset == OUT_OF_MEMORY) {
+    // <padding><node_header><next_offsets><key><value><padding>
+    int headerOff = 0;
+    int towerOff  = NODE_SIZE;
+    int keyOff    = towerOff + height * Integer.BYTES;
+    int valOff    = keyOff + key.length;
+
+    int nodeSize = valOff + value.length;
+    long offset = reserve(nodeSize);
+    if (offset == OUT_OF_MEMORY) {
       return OUT_OF_MEMORY;
     }
-    int valueOffset = putBytes(value);
-    if (valueOffset == OUT_OF_MEMORY) {
-      return OUT_OF_MEMORY;
+
+    long packedValue = ((valOff & 0xffffffffL) << 32) | (value.length & 0xffffffffL);
+    VALUE_HANDLE.set(memory, offset + headerOff, packedValue);
+    KEY_OFFSET_HANDLE.set(memory, offset + keyOff, (int)(offset + keyOff));
+    KEY_SIZE_HANDLE.set(memory, offset + keyOff, (short) key.length);
+    HEIGHT_HANDLE.set(memory, offset + headerOff, (short) height);
+
+    long towerBase = (long) offset + NODE_SIZE;
+    for (int lvl = 0; lvl < height; lvl++) {
+      NEXT_HANDLE.set(memory, towerBase + (long) lvl * Integer.BYTES, NULL);
     }
-    int keyOffset = putBytes(key);
-    if (keyOffset == OUT_OF_MEMORY) {
-      return OUT_OF_MEMORY;
-    }
-    long packedValue = ((long) valueOffset << 32) | value.length;
-    VALUE_HANDLE.set(memory, nodeOffset, packedValue);
-    KEY_OFFSET_HANDLE.set(memory, nodeOffset, keyOffset);
-    KEY_SIZE_HANDLE.set(memory, nodeOffset, (short) key.length);
-    HEIGHT_HANDLE.set(memory, nodeOffset, (short) height);
-    // do we need to int the tower with NULL?
-    return nodeOffset;
+
+    MemorySegment.copy(key,   0, memory, JAVA_BYTE, offset + keyOff, key.length);
+    MemorySegment.copy(value, 0, memory, JAVA_BYTE, offset + valOff, value.length);
+
+    return (int) offset;
   }
 
-  private int allocateNode(int height) {
-    int nodeSize = NODE_SIZE + height * Integer.BYTES;
-
+  private int reserve(int bytes) {
     int cur, start, next;
+    int total = align(bytes); // align allocation size
     do {
       cur = head.get();
-      start = align(cur, 8);
-      next  = start + nodeSize;
+      start = align(cur);
+      next = start + total;
       if (next > memorySize) return OUT_OF_MEMORY;
     } while (!head.compareAndSet(cur, next));
-
     return start;
   }
 
-  private static int align(int x, int alignment) {
-    return (x + 7) & ~7;
-  }
-
-  private int putBytes(byte[] bytes) {
-    int offset = head.getAndAdd(bytes.length);
-    if (offset + bytes.length > memorySize) {
-      return OUT_OF_MEMORY;
-    }
-    MemorySegment.copy(bytes, 0, this.memory, JAVA_BYTE, offset, bytes.length);
-    return offset;
-  }
-
-  private int getRandomHights() {
+  private int getRandomHeights() {
     int r = FastRand.nextInt();
     int zeros = Integer.numberOfTrailingZeros(r) >> 1;
     return Math.min(zeros + 1, MAX_HEIGHT);
@@ -116,7 +106,10 @@ public class SkipList {
 
   public void reset() {
     head.set(1);
-    height.set(1);
+  }
+
+  private static int align(int x) {
+    return (x + 7) & ~7;
   }
 
 }
