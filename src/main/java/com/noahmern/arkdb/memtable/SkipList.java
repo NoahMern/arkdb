@@ -42,6 +42,8 @@ public class SkipList {
 
   private static final int NULL = 0;
 
+  public static final int OUT_OF_MEMORY = -1;
+
   private final MemorySegment memory;
   private final int memorySize;
   // memory 0 is reserved for representing NULL pointer
@@ -59,8 +61,17 @@ public class SkipList {
 
   private int newNode(byte[] key, byte[] value,int height) {
     int nodeOffset = allocateNode(height);
+    if (nodeOffset == OUT_OF_MEMORY) {
+      return OUT_OF_MEMORY;
+    }
     int valueOffset = putBytes(value);
+    if (valueOffset == OUT_OF_MEMORY) {
+      return OUT_OF_MEMORY;
+    }
     int keyOffset = putBytes(key);
+    if (keyOffset == OUT_OF_MEMORY) {
+      return OUT_OF_MEMORY;
+    }
     long packedValue = ((long) valueOffset << 32) | value.length;
     VALUE_HANDLE.set(memory, nodeOffset, packedValue);
     KEY_OFFSET_HANDLE.set(memory, nodeOffset, keyOffset);
@@ -78,7 +89,7 @@ public class SkipList {
       cur = head.get();
       start = align(cur, 8);
       next  = start + nodeSize;
-      if (next > memorySize) throw new OutOfMemoryError("SkipList memory exhausted");
+      if (next > memorySize) return OUT_OF_MEMORY;
     } while (!head.compareAndSet(cur, next));
 
     return start;
@@ -91,7 +102,7 @@ public class SkipList {
   private int putBytes(byte[] bytes) {
     int offset = head.getAndAdd(bytes.length);
     if (offset + bytes.length > memorySize) {
-      throw new OutOfMemoryError("SkipList memory exhausted");
+      return OUT_OF_MEMORY;
     }
     MemorySegment.copy(bytes, 0, this.memory, JAVA_BYTE, offset, bytes.length);
     return offset;
